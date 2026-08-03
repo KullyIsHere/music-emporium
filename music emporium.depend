@@ -1,0 +1,32 @@
+# depslib dependency file v1.0
+1785738516 source:g:\users\abdul\onedrive\documents\coding\music emporium\audio.c
+	<stdlib.h>
+	<math.h>
+	"music.h"
+	"audio.h"
+
+1785748840 g:\users\abdul\onedrive\documents\coding\music emporium\music.h
+	<stdio.h>
+	<stdlib.h>
+	<conio.h>
+	<windows.h>
+	<dirent.h>
+	<string.h>
+	<mmsystem.h>
+
+1785687691 g:\users\abdul\onedrive\documents\coding\music emporium\audio.h
+
+1785748849 source:g:\users\abdul\onedrive\documents\coding\music emporium\utils.c
+	"music.h"
+	<sys/stat.h>
+
+1785748861 source:g:\users\abdul\onedrive\documents\coding\music emporium\draw.c
+	"music.h"
+
+1785738512 source:g:\users\abdul\onedrive\documents\coding\music emporium\file.c
+	"music.h"
+
+1785748890 source:g:\users\abdul\onedrive\documents\coding\music emporium\main.c
+	"music.h"
+	"audio.h"
+
