@@ -57,6 +57,20 @@ void audio_close(void) {
     }
 }
 
+//Stops sounding notes without closing the output devices.
+void audio_stop_all(void) {
+    for (int i = 0; i < VOICE_COUNT; i++) {
+        if (voices[i].handle != NULL) {
+            waveOutReset(voices[i].handle);
+            if (voices[i].buffer != NULL) {
+                waveOutUnprepareHeader(voices[i].handle, &voices[i].hdr, sizeof(WAVEHDR));
+                free(voices[i].buffer);
+                voices[i].buffer = NULL;
+            }
+        }
+    }
+}
+
 //Generates a sine wave and plays it without blocking, so many tones can sound at once.
 void play_tone(int frequency, int duration_ms) {
     if (frequency <= 0 || duration_ms <= 0) return;

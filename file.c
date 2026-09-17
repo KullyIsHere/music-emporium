@@ -74,3 +74,29 @@ int load_music_file(MusicFile *music, current_data current) {
 
     return 1;
 }
+
+//Loads exactly one .me file for the graphical editor.
+//Unlike the legacy multi-file loader, this reports malformed and partial files.
+int load_music_file_path(MusicFile *music, const char *path) {
+    if (music == NULL || path == NULL || path[0] == '\0')
+        return 0;
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL)
+        return 0;
+
+    MusicFile loaded;
+    memset(&loaded, 0, sizeof(loaded));
+    size_t read = fread(&loaded, sizeof(loaded), 1, file);
+    int has_extra_data = fgetc(file) != EOF;
+    fclose(file);
+
+    if (read != 1 || has_extra_data || memcmp(loaded.magic, "MEF", 3) != 0 ||
+        loaded.columns < 10 || loaded.columns > 100 ||
+        loaded.rows < 1 || loaded.rows > 10) {
+        return 0;
+    }
+
+    *music = loaded;
+    return 1;
+}

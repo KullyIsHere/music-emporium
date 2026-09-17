@@ -58,6 +58,7 @@ void draw(current_data current,MusicFile music);
 void save_music_file(MusicFile *music);
 int make_music_file(MusicFile *music, const char *name, int columns, int rows);
 int load_music_file(MusicFile *music, current_data current);
+int load_music_file_path(MusicFile *music, const char *path);
 int Calculate_page_num(current_data current);
 void output_frequency_table();
 void list_directory(current_data *current);
