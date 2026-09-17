@@ -3,6 +3,7 @@
 #include "gui.h"
 #include "music.h"
 #include "audio.h"
+#include "export.h"
 
 #define MAX_RECENT_FILES 12
 #define DISCOVERY_DEPTH 3
@@ -13,6 +14,13 @@ enum {
     FILE_COL_PATH,
     FILE_N_COLUMNS
 };
+
+typedef enum {
+    TOOL_SELECT,
+    TOOL_BRUSH,
+    TOOL_RECTANGLE,
+    TOOL_DRAG
+} EditorTool;
 
 //Holds the loaded music data and current state for the GUI
 typedef struct {
@@ -30,6 +38,8 @@ static GtkWidget *selection_label;
 static GtkWidget *frequency_spin;
 static GtkWidget *duration_spin;
 static GtkWidget *play_button;
+static GtkWidget *volume_label;
+static GtkWidget *tool_buttons[4];
 static GtkWidget *cell_buttons[100][10];
 static guint status_ctx;
 static AppState app_state;
@@ -40,7 +50,24 @@ static guint playback_timer = 0;
 static int playback_column = 0;
 static int playhead_column = -1;
 static gboolean playback_running = FALSE;
+static int resize_start_columns = 0;
+static int resize_start_rows = 0;
+static int pending_columns = 0;
+static int pending_rows = 0;
+static int preview_columns = -1;
+static int preview_rows = -1;
+static GPtrArray *resize_preview_widgets = NULL;
+static EditorTool active_tool = TOOL_SELECT;
+static gboolean selected_tiles[100][10];
+static gboolean changing_tool_buttons = FALSE;
+static int gesture_start_x = -1;
+static int gesture_start_y = -1;
+static int brush_frequency = 440;
+static int brush_duration = 250;
 static void remember_recent_file(const char *path);
+static void rebuild_editor(void);
+static void clear_resize_preview(void);
+static int snapped_drag_steps(double distance, int cell_size);
 
 static const char *piano_names[10] = {
     "E5", "D♯5", "D5", "C♯5", "C5", "B4", "A♯4", "A4", "G♯4", "G4"
@@ -72,6 +99,7 @@ static void refresh_cell(int x, int y) {
     GtkStyleContext *context = gtk_widget_get_style_context(button);
     gtk_style_context_remove_class(context, "step-active");
     gtk_style_context_remove_class(context, "step-selected");
+    gtk_style_context_remove_class(context, "tile-selected");
     if (app_state.music[0].music_data[x][y][0] > 0 &&
         app_state.music[0].music_data[x][y][1] > 0) {
         gtk_style_context_add_class(context, "step-active");
@@ -81,6 +109,39 @@ static void refresh_cell(int x, int y) {
     }
     if (x == selected_x && y == selected_y)
         gtk_style_context_add_class(context, "step-selected");
+    if (selected_tiles[x][y])
+        gtk_style_context_add_class(context, "tile-selected");
+}
+
+static void clear_tile_selection(void) {
+    for (int x = 0; x < app_state.music[0].columns; x++) {
+        for (int y = 0; y < app_state.music[0].rows; y++) {
+            selected_tiles[x][y] = FALSE;
+            refresh_cell(x, y);
+        }
+    }
+}
+
+static void set_tile_selected(int x, int y, gboolean selected) {
+    if (x < 0 || x >= app_state.music[0].columns || y < 0 || y >= app_state.music[0].rows)
+        return;
+    selected_tiles[x][y] = selected;
+    refresh_cell(x, y);
+}
+
+static void paint_cell(int x, int y) {
+    if (x < 0 || x >= app_state.music[0].columns || y < 0 || y >= app_state.music[0].rows)
+        return;
+    int frequency = brush_frequency > 0 ? brush_frequency : piano_frequencies[y];
+    int duration = brush_duration > 0 ? brush_duration : 250;
+    app_state.music[0].music_data[x][y][0] = frequency;
+    app_state.music[0].music_data[x][y][1] = duration;
+    int old_x = selected_x;
+    int old_y = selected_y;
+    selected_x = x;
+    selected_y = y;
+    if (old_x >= 0 && old_y >= 0) refresh_cell(old_x, old_y);
+    refresh_cell(x, y);
 }
 
 static void select_cell(int x, int y) {
@@ -107,7 +168,185 @@ static void select_cell(int x, int y) {
 
 static void on_cell_clicked(GtkButton *button, gpointer user_data) {
     int packed = GPOINTER_TO_INT(user_data);
-    select_cell(packed / 10, packed % 10);
+    int x = packed / 10;
+    int y = packed % 10;
+    if (active_tool == TOOL_BRUSH) {
+        paint_cell(x, y);
+    } else if (active_tool == TOOL_SELECT) {
+        set_tile_selected(x, y, !selected_tiles[x][y]);
+        select_cell(x, y);
+    }
+}
+
+static void clear_drag_target_preview(void) {
+    for (int x = 0; x < app_state.music[0].columns; x++) {
+        for (int y = 0; y < app_state.music[0].rows; y++) {
+            if (cell_buttons[x][y] != NULL)
+                gtk_style_context_remove_class(
+                    gtk_widget_get_style_context(cell_buttons[x][y]), "drag-target");
+        }
+    }
+}
+
+static void preview_drag_selection(int delta_x, int delta_y) {
+    clear_drag_target_preview();
+    for (int x = 0; x < app_state.music[0].columns; x++) {
+        for (int y = 0; y < app_state.music[0].rows; y++) {
+            if (!selected_tiles[x][y]) continue;
+            int target_x = x + delta_x;
+            int target_y = y + delta_y;
+            if (target_x >= 0 && target_x < app_state.music[0].columns &&
+                target_y >= 0 && target_y < app_state.music[0].rows) {
+                gtk_style_context_add_class(
+                    gtk_widget_get_style_context(cell_buttons[target_x][target_y]), "drag-target");
+            }
+        }
+    }
+}
+
+static void move_selected_tiles(int delta_x, int delta_y) {
+    int min_x = 100, max_x = -1, min_y = 10, max_y = -1;
+    for (int x = 0; x < app_state.music[0].columns; x++) {
+        for (int y = 0; y < app_state.music[0].rows; y++) {
+            if (!selected_tiles[x][y]) continue;
+            min_x = MIN(min_x, x); max_x = MAX(max_x, x);
+            min_y = MIN(min_y, y); max_y = MAX(max_y, y);
+        }
+    }
+    if (max_x < 0) return;
+    delta_x = CLAMP(delta_x, -min_x, app_state.music[0].columns - 1 - max_x);
+    delta_y = CLAMP(delta_y, -min_y, app_state.music[0].rows - 1 - max_y);
+    if (delta_x == 0 && delta_y == 0) return;
+
+    int notes[100][10][2];
+    gboolean moved_selection[100][10] = {{FALSE}};
+    memcpy(notes, app_state.music[0].music_data, sizeof(notes));
+    for (int x = 0; x < app_state.music[0].columns; x++) {
+        for (int y = 0; y < app_state.music[0].rows; y++) {
+            if (selected_tiles[x][y]) {
+                app_state.music[0].music_data[x][y][0] = 0;
+                app_state.music[0].music_data[x][y][1] = 0;
+            }
+        }
+    }
+    for (int x = 0; x < app_state.music[0].columns; x++) {
+        for (int y = 0; y < app_state.music[0].rows; y++) {
+            if (!selected_tiles[x][y]) continue;
+            int target_x = x + delta_x;
+            int target_y = y + delta_y;
+            app_state.music[0].music_data[target_x][target_y][0] = notes[x][y][0];
+            app_state.music[0].music_data[target_x][target_y][1] = notes[x][y][1];
+            moved_selection[target_x][target_y] = TRUE;
+        }
+    }
+    memcpy(selected_tiles, moved_selection, sizeof(selected_tiles));
+    selected_x = CLAMP(selected_x + delta_x, 0, app_state.music[0].columns - 1);
+    selected_y = CLAMP(selected_y + delta_y, 0, app_state.music[0].rows - 1);
+    for (int x = 0; x < app_state.music[0].columns; x++)
+        for (int y = 0; y < app_state.music[0].rows; y++) refresh_cell(x, y);
+    select_cell(selected_x, selected_y);
+    show_status("Moved selected tiles. Save to keep the change.");
+}
+
+static void on_tile_drag_begin(GtkGestureDrag *gesture, double start_x,
+                               double start_y, gpointer user_data) {
+    int packed = GPOINTER_TO_INT(user_data);
+    gesture_start_x = packed / 10;
+    gesture_start_y = packed % 10;
+    if (active_tool == TOOL_RECTANGLE) {
+        clear_tile_selection();
+        set_tile_selected(gesture_start_x, gesture_start_y, TRUE);
+    } else if (active_tool == TOOL_DRAG && !selected_tiles[gesture_start_x][gesture_start_y]) {
+        clear_tile_selection();
+        set_tile_selected(gesture_start_x, gesture_start_y, TRUE);
+        select_cell(gesture_start_x, gesture_start_y);
+    } else if (active_tool == TOOL_BRUSH) {
+        paint_cell(gesture_start_x, gesture_start_y);
+    }
+}
+
+static void on_tile_drag_update(GtkGestureDrag *gesture, double offset_x,
+                                double offset_y, gpointer user_data) {
+    int target_x = CLAMP(gesture_start_x + snapped_drag_steps(offset_x, 46),
+        0, app_state.music[0].columns - 1);
+    int target_y = CLAMP(gesture_start_y + snapped_drag_steps(offset_y, 52),
+        0, app_state.music[0].rows - 1);
+    if (active_tool == TOOL_RECTANGLE) {
+        clear_tile_selection();
+        for (int x = MIN(gesture_start_x, target_x); x <= MAX(gesture_start_x, target_x); x++)
+            for (int y = MIN(gesture_start_y, target_y); y <= MAX(gesture_start_y, target_y); y++)
+                set_tile_selected(x, y, TRUE);
+        select_cell(target_x, target_y);
+    } else if (active_tool == TOOL_BRUSH) {
+        int x = gesture_start_x;
+        int y = gesture_start_y;
+        int dx = ABS(target_x - x), sx = x < target_x ? 1 : -1;
+        int dy = -ABS(target_y - y), sy = y < target_y ? 1 : -1;
+        int error = dx + dy;
+        while (TRUE) {
+            paint_cell(x, y);
+            if (x == target_x && y == target_y) break;
+            int twice = 2 * error;
+            if (twice >= dy) { error += dy; x += sx; }
+            if (twice <= dx) { error += dx; y += sy; }
+        }
+    } else if (active_tool == TOOL_DRAG) {
+        preview_drag_selection(target_x - gesture_start_x, target_y - gesture_start_y);
+    }
+}
+
+static void on_tile_drag_end(GtkGestureDrag *gesture, double offset_x,
+                             double offset_y, gpointer user_data) {
+    if (active_tool == TOOL_DRAG) {
+        int delta_x = snapped_drag_steps(offset_x, 46);
+        int delta_y = snapped_drag_steps(offset_y, 52);
+        clear_drag_target_preview();
+        move_selected_tiles(delta_x, delta_y);
+    }
+    gesture_start_x = gesture_start_y = -1;
+}
+
+static void activate_editor_tool(EditorTool tool) {
+    active_tool = tool;
+    changing_tool_buttons = TRUE;
+    for (int i = 0; i < 4; i++)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool_buttons[i]), i == tool);
+    changing_tool_buttons = FALSE;
+    clear_drag_target_preview();
+    if (tool == TOOL_BRUSH) {
+        int current_frequency = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(frequency_spin));
+        int current_duration = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(duration_spin));
+        if (current_frequency > 0) brush_frequency = current_frequency;
+        if (current_duration > 0) brush_duration = current_duration;
+        updating_controls = TRUE;
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(frequency_spin), brush_frequency);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(duration_spin), brush_duration);
+        updating_controls = FALSE;
+    }
+    const char *names[] = {"Select", "Brush", "Rectangle", "Drag"};
+    char message[80];
+    g_snprintf(message, sizeof(message), "%s tool active.", names[tool]);
+    show_status(message);
+}
+
+static void on_tool_toggled(GtkToggleButton *button, gpointer user_data) {
+    if (changing_tool_buttons) return;
+    EditorTool tool = (EditorTool)GPOINTER_TO_INT(user_data);
+    if (gtk_toggle_button_get_active(button)) activate_editor_tool(tool);
+    else if (active_tool == tool) gtk_toggle_button_set_active(button, TRUE);
+}
+
+static gboolean on_editor_key_press(GtkWidget *widget, GdkEventKey *event, gpointer user_data) {
+    if (gtk_stack_get_visible_child_name(GTK_STACK(main_stack)) == NULL ||
+        strcmp(gtk_stack_get_visible_child_name(GTK_STACK(main_stack)), "editor") != 0)
+        return FALSE;
+    switch (gdk_keyval_to_lower(event->keyval)) {
+        case GDK_KEY_s: activate_editor_tool(TOOL_SELECT); return TRUE;
+        case GDK_KEY_b: activate_editor_tool(TOOL_BRUSH); return TRUE;
+        case GDK_KEY_m: activate_editor_tool(TOOL_RECTANGLE); return TRUE;
+        case GDK_KEY_d: activate_editor_tool(TOOL_DRAG); return TRUE;
+        default: return FALSE;
+    }
 }
 
 static void on_note_value_changed(GtkSpinButton *spin, gpointer user_data) {
@@ -115,6 +354,11 @@ static void on_note_value_changed(GtkSpinButton *spin, gpointer user_data) {
         return;
 
     int value_index = GPOINTER_TO_INT(user_data);
+    if (active_tool == TOOL_BRUSH) {
+        if (value_index == 0) brush_frequency = gtk_spin_button_get_value_as_int(spin);
+        else brush_duration = gtk_spin_button_get_value_as_int(spin);
+        return;
+    }
     app_state.music[0].music_data[selected_x][selected_y][value_index] =
         gtk_spin_button_get_value_as_int(spin);
     refresh_cell(selected_x, selected_y);
@@ -152,6 +396,95 @@ static gboolean save_current_file(void) {
     gboolean success = fwrite(&app_state.music[0], sizeof(MusicFile), 1, file) == 1;
     fclose(file);
     return success;
+}
+
+static char *path_with_extension(const char *path, const char *extension) {
+    size_t path_length = strlen(path);
+    size_t extension_length = strlen(extension);
+    if (path_length >= extension_length &&
+        g_ascii_strcasecmp(path + path_length - extension_length, extension) == 0)
+        return g_strdup(path);
+    return g_strconcat(path, extension, NULL);
+}
+
+static char *choose_export_path(const char *title, const char *suggested_name,
+                                const char *filter_name, const char *pattern) {
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(title, GTK_WINDOW(main_window),
+        GTK_FILE_CHOOSER_ACTION_SAVE, "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Save", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), suggested_name);
+    GtkFileFilter *filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(filter, filter_name);
+    gtk_file_filter_add_pattern(filter, pattern);
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
+
+    char *path = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT)
+        path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+    gtk_widget_destroy(dialog);
+    return path;
+}
+
+static void on_save_as_clicked(GtkWidget *widget, gpointer user_data) {
+    char suggested[128];
+    g_snprintf(suggested, sizeof(suggested), "%s.me", app_state.music[0].filename);
+    char *chosen = choose_export_path("Save Composition As", suggested,
+        "Music Emporium files (*.me)", "*.me");
+    if (chosen == NULL) return;
+    char *path = path_with_extension(chosen, ".me");
+    g_free(chosen);
+
+    char old_name[sizeof(app_state.music[0].filename)];
+    g_strlcpy(old_name, app_state.music[0].filename, sizeof(old_name));
+    char *basename = g_path_get_basename(path);
+    char *dot = strrchr(basename, '.');
+    if (dot != NULL) *dot = '\0';
+    g_strlcpy(app_state.music[0].filename, basename, sizeof(app_state.music[0].filename));
+    g_free(basename);
+
+    FILE *file = g_fopen(path, "wb");
+    gboolean success = file != NULL &&
+        fwrite(&app_state.music[0], sizeof(MusicFile), 1, file) == 1;
+    if (file != NULL) fclose(file);
+    if (success) {
+        g_strlcpy(app_state.current.file, path, sizeof(app_state.current.file));
+        remember_recent_file(path);
+        rebuild_editor();
+        show_status("Saved a new .me copy and switched the editor to it.");
+    } else {
+        g_strlcpy(app_state.music[0].filename, old_name, sizeof(app_state.music[0].filename));
+        show_status("Could not save the new .me file.");
+    }
+    g_free(path);
+}
+
+static void on_export_clicked(GtkWidget *widget, gpointer user_data) {
+    gboolean mp4 = GPOINTER_TO_INT(user_data);
+    const char *extension = mp4 ? ".mp4" : ".wav";
+    char suggested[128];
+    g_snprintf(suggested, sizeof(suggested), "%s%s",
+        app_state.music[0].filename, extension);
+    char *chosen = choose_export_path(mp4 ? "Export MP4" : "Export WAV", suggested,
+        mp4 ? "MP4 video (*.mp4)" : "Wave audio (*.wav)", mp4 ? "*.mp4" : "*.wav");
+    if (chosen == NULL) return;
+    char *path = path_with_extension(chosen, extension);
+    g_free(chosen);
+
+    show_status(mp4 ? "Rendering MP4…" : "Rendering WAV…");
+    while (gtk_events_pending()) gtk_main_iteration();
+    char error[256] = "";
+    int success = mp4
+        ? export_music_mp4(&app_state.music[0], path, audio_get_volume(), error, sizeof(error))
+        : export_music_wav(&app_state.music[0], path, audio_get_volume(), error, sizeof(error));
+    if (success) {
+        char message[640];
+        g_snprintf(message, sizeof(message), "Exported %s", path);
+        show_status(message);
+    } else {
+        show_status(error);
+    }
+    g_free(path);
 }
 
 static void on_save_clicked(GtkButton *button, gpointer user_data) {
@@ -285,9 +618,264 @@ static void on_next_clicked(GtkButton *button, gpointer user_data) {
     move_playhead(1);
 }
 
+static void on_volume_changed(GtkRange *range, gpointer user_data) {
+    int percent = (int)gtk_range_get_value(range);
+    audio_set_volume(percent / 100.0);
+
+    char text[24];
+    if (percent == 0)
+        snprintf(text, sizeof(text), "MUTE");
+    else
+        snprintf(text, sizeof(text), "%d%%", percent);
+    gtk_label_set_text(GTK_LABEL(volume_label), text);
+}
+
+static int snapped_drag_steps(double distance, int cell_size) {
+    if (distance >= 0)
+        return (int)((distance + cell_size / 2.0) / cell_size);
+    return (int)((distance - cell_size / 2.0) / cell_size);
+}
+
+static void on_resize_drag_begin(GtkGestureDrag *gesture, double start_x,
+                                 double start_y, gpointer user_data) {
+    clear_resize_preview();
+    resize_start_columns = app_state.music[0].columns;
+    resize_start_rows = app_state.music[0].rows;
+    preview_columns = resize_start_columns;
+    preview_rows = resize_start_rows;
+}
+
+static void clear_resize_preview(void) {
+    if (resize_preview_widgets != NULL) {
+        for (guint i = 0; i < resize_preview_widgets->len; i++) {
+            GtkWidget *widget = g_ptr_array_index(resize_preview_widgets, i);
+            if (GTK_IS_WIDGET(widget)) gtk_widget_destroy(widget);
+        }
+        g_ptr_array_set_size(resize_preview_widgets, 0);
+    }
+    for (int x = 0; x < app_state.music[0].columns; x++) {
+        for (int y = 0; y < app_state.music[0].rows; y++) {
+            if (cell_buttons[x][y] != NULL) {
+                gtk_style_context_remove_class(
+                    gtk_widget_get_style_context(cell_buttons[x][y]), "resize-remove-preview");
+                gtk_widget_set_opacity(cell_buttons[x][y], 1.0);
+            }
+        }
+    }
+}
+
+static GtkWidget *add_resize_preview_cell(int column, int row, int width, int height) {
+    GtkWidget *cell = gtk_label_new("");
+    gtk_widget_set_size_request(cell, width, height);
+    gtk_widget_set_opacity(cell, 0.48);
+    gtk_style_context_add_class(gtk_widget_get_style_context(cell), "resize-add-preview");
+    gtk_grid_attach(GTK_GRID(editor_grid), cell, column, row, 1, 1);
+    g_ptr_array_add(resize_preview_widgets, cell);
+    return cell;
+}
+
+static void update_resize_preview(int target_columns, int target_rows) {
+    MusicFile *music = &app_state.music[0];
+    target_columns = CLAMP(target_columns, 10, 100);
+    target_rows = CLAMP(target_rows, 1, 10);
+    if (target_columns == preview_columns && target_rows == preview_rows)
+        return;
+
+    clear_resize_preview();
+    preview_columns = target_columns;
+    preview_rows = target_rows;
+    if (resize_preview_widgets == NULL)
+        resize_preview_widgets = g_ptr_array_new();
+
+    if (target_columns > music->columns) {
+        for (int x = music->columns; x < target_columns; x++) {
+            int grid_x = x + 2; /* Preview is drawn just beyond the live edge grip. */
+            GtkWidget *number = add_resize_preview_cell(grid_x, 0, 42, 18);
+            char text[12];
+            g_snprintf(text, sizeof(text), "%d", x + 1);
+            gtk_label_set_text(GTK_LABEL(number), text);
+            for (int y = 0; y < music->rows; y++)
+                add_resize_preview_cell(grid_x, y + 1, 42, 48);
+        }
+    } else if (target_columns < music->columns) {
+        for (int x = target_columns; x < music->columns; x++) {
+            for (int y = 0; y < music->rows; y++) {
+                gtk_style_context_add_class(
+                    gtk_widget_get_style_context(cell_buttons[x][y]), "resize-remove-preview");
+                gtk_widget_set_opacity(cell_buttons[x][y], 0.38);
+            }
+        }
+    }
+
+    if (target_rows > music->rows) {
+        for (int y = music->rows; y < target_rows; y++) {
+            int grid_y = y + 2; /* Preview is drawn below the live edge grip. */
+            add_resize_preview_cell(0, grid_y, 82, 48);
+            for (int x = 0; x < music->columns; x++)
+                add_resize_preview_cell(x + 1, grid_y, 42, 48);
+        }
+    } else if (target_rows < music->rows) {
+        for (int y = target_rows; y < music->rows; y++) {
+            for (int x = 0; x < music->columns; x++) {
+                gtk_style_context_add_class(
+                    gtk_widget_get_style_context(cell_buttons[x][y]), "resize-remove-preview");
+                gtk_widget_set_opacity(cell_buttons[x][y], 0.38);
+            }
+        }
+    }
+    gtk_widget_show_all(editor_grid);
+}
+
+static void on_resize_drag_update(GtkGestureDrag *gesture, double offset_x,
+                                  double offset_y, gpointer user_data) {
+    int axis = GPOINTER_TO_INT(user_data);
+    int columns = resize_start_columns;
+    int rows = resize_start_rows;
+    if (axis == 0)
+        columns = CLAMP(resize_start_columns + snapped_drag_steps(offset_x, 46), 10, 100);
+    else
+        rows = CLAMP(resize_start_rows + snapped_drag_steps(offset_y, 52), 1, 10);
+    update_resize_preview(columns, rows);
+}
+
+static void resize_music_grid(int new_columns, int new_rows) {
+    MusicFile *music = &app_state.music[0];
+    int old_columns = music->columns;
+    int old_rows = music->rows;
+
+    new_columns = CLAMP(new_columns, 10, 100);
+    new_rows = CLAMP(new_rows, 1, 10);
+    if (new_columns == old_columns && new_rows == old_rows)
+        return;
+
+    if (new_columns > old_columns) {
+        for (int x = old_columns; x < new_columns; x++) {
+            memset(music->music_data[x], 0, sizeof(music->music_data[x]));
+            music->Intervals[x] = 400;
+        }
+    }
+    if (new_rows > old_rows) {
+        for (int x = 0; x < new_columns; x++) {
+            for (int y = old_rows; y < new_rows; y++)
+                memset(music->music_data[x][y], 0, sizeof(music->music_data[x][y]));
+        }
+    }
+
+    music->columns = new_columns;
+    music->rows = new_rows;
+    rebuild_editor();
+
+    char message[96];
+    snprintf(message, sizeof(message), "Grid resized to %d steps × %d notes. Save to keep it.",
+        music->columns, music->rows);
+    show_status(message);
+}
+
+static gboolean apply_pending_resize(gpointer user_data) {
+    resize_music_grid(pending_columns, pending_rows);
+    return G_SOURCE_REMOVE;
+}
+
+static void on_grid_size_clicked(GtkWidget *widget, gpointer user_data) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Grid Size", GTK_WINDOW(main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Apply", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *grid = gtk_grid_new();
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 16);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 12);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 18);
+    GtkWidget *column_label = gtk_label_new("Columns / steps");
+    GtkWidget *row_label = gtk_label_new("Rows / notes");
+    GtkWidget *column_spin = gtk_spin_button_new_with_range(10, 100, 1);
+    GtkWidget *row_spin = gtk_spin_button_new_with_range(1, 10, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(column_spin), app_state.music[0].columns);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(row_spin), app_state.music[0].rows);
+    gtk_grid_attach(GTK_GRID(grid), column_label, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), column_spin, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), row_label, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), row_spin, 1, 1, 1, 1);
+    gtk_container_add(GTK_CONTAINER(content), grid);
+    gtk_widget_show_all(dialog);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        resize_music_grid(gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(column_spin)),
+            gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(row_spin)));
+    }
+    gtk_widget_destroy(dialog);
+}
+
+static void on_adjust_grid_clicked(GtkWidget *widget, gpointer user_data) {
+    int action = GPOINTER_TO_INT(user_data);
+    int columns = app_state.music[0].columns;
+    int rows = app_state.music[0].rows;
+    if (action == 0) columns++;
+    else if (action == 1) columns--;
+    else if (action == 2) rows++;
+    else rows--;
+    resize_music_grid(columns, rows);
+}
+
+static void on_resize_drag_end(GtkGestureDrag *gesture, double offset_x,
+                               double offset_y, gpointer user_data) {
+    int axis = GPOINTER_TO_INT(user_data);
+    pending_columns = resize_start_columns;
+    pending_rows = resize_start_rows;
+
+    if (axis == 0) {
+        pending_columns = CLAMP(resize_start_columns + snapped_drag_steps(offset_x, 46), 10, 100);
+    } else {
+        pending_rows = CLAMP(resize_start_rows + snapped_drag_steps(offset_y, 52), 1, 10);
+    }
+
+    clear_resize_preview();
+    preview_columns = -1;
+    preview_rows = -1;
+    if (pending_columns != app_state.music[0].columns ||
+        pending_rows != app_state.music[0].rows) {
+        g_idle_add(apply_pending_resize, NULL);
+    }
+}
+
+static gboolean on_resize_grip_enter(GtkWidget *widget, GdkEventCrossing *event,
+                                     gpointer user_data) {
+    int axis = GPOINTER_TO_INT(user_data);
+    GdkDisplay *display = gtk_widget_get_display(widget);
+    GdkCursor *cursor = gdk_cursor_new_for_display(display,
+        axis == 0 ? GDK_SB_H_DOUBLE_ARROW : GDK_SB_V_DOUBLE_ARROW);
+    gdk_window_set_cursor(gtk_widget_get_window(widget), cursor);
+    g_object_unref(cursor);
+    return FALSE;
+}
+
+static gboolean on_resize_grip_leave(GtkWidget *widget, GdkEventCrossing *event,
+                                     gpointer user_data) {
+    gdk_window_set_cursor(gtk_widget_get_window(widget), NULL);
+    return FALSE;
+}
+
+static GtkWidget *make_resize_grip(int axis) {
+    GtkWidget *grip = gtk_event_box_new();
+    GtkWidget *text = gtk_label_new(" ");
+    gtk_container_add(GTK_CONTAINER(grip), text);
+    gtk_style_context_add_class(gtk_widget_get_style_context(grip), "resize-grip");
+    gtk_widget_add_events(grip, GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK);
+    g_signal_connect(grip, "enter-notify-event", G_CALLBACK(on_resize_grip_enter), GINT_TO_POINTER(axis));
+    g_signal_connect(grip, "leave-notify-event", G_CALLBACK(on_resize_grip_leave), GINT_TO_POINTER(axis));
+
+    GtkGesture *drag = gtk_gesture_drag_new(grip);
+    g_signal_connect(drag, "drag-begin", G_CALLBACK(on_resize_drag_begin), GINT_TO_POINTER(axis));
+    g_signal_connect(drag, "drag-update", G_CALLBACK(on_resize_drag_update), GINT_TO_POINTER(axis));
+    g_signal_connect(drag, "drag-end", G_CALLBACK(on_resize_drag_end), GINT_TO_POINTER(axis));
+    g_object_set_data_full(G_OBJECT(grip), "resize-gesture", drag, g_object_unref);
+    return grip;
+}
+
 static void rebuild_editor(void) {
     pause_playback();
     show_playhead(-1);
+    clear_resize_preview();
     GList *children = gtk_container_get_children(GTK_CONTAINER(editor_grid));
     for (GList *item = children; item != NULL; item = item->next)
         gtk_widget_destroy(GTK_WIDGET(item->data));
@@ -328,18 +916,40 @@ static void rebuild_editor(void) {
             gtk_style_context_add_class(gtk_widget_get_style_context(cell), "step-cell");
             g_signal_connect(cell, "clicked", G_CALLBACK(on_cell_clicked),
                 GINT_TO_POINTER(x * 10 + y));
+            GtkGesture *tile_drag = gtk_gesture_drag_new(cell);
+            gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(tile_drag), GDK_BUTTON_PRIMARY);
+            g_signal_connect(tile_drag, "drag-begin", G_CALLBACK(on_tile_drag_begin),
+                GINT_TO_POINTER(x * 10 + y));
+            g_signal_connect(tile_drag, "drag-update", G_CALLBACK(on_tile_drag_update),
+                GINT_TO_POINTER(x * 10 + y));
+            g_signal_connect(tile_drag, "drag-end", G_CALLBACK(on_tile_drag_end),
+                GINT_TO_POINTER(x * 10 + y));
+            g_object_set_data_full(G_OBJECT(cell), "tile-drag", tile_drag, g_object_unref);
             gtk_grid_attach(GTK_GRID(editor_grid), cell, x + 1, y + 1, 1, 1);
             cell_buttons[x][y] = cell;
             refresh_cell(x, y);
         }
     }
+
+    GtkWidget *column_grip = make_resize_grip(0);
+    gtk_widget_set_size_request(column_grip, 12, -1);
+    gtk_grid_attach(GTK_GRID(editor_grid), column_grip,
+        music->columns + 1, 1, 1, music->rows);
+
+    GtkWidget *row_grip = make_resize_grip(1);
+    gtk_widget_set_size_request(row_grip, -1, 12);
+    gtk_grid_attach(GTK_GRID(editor_grid), row_grip,
+        1, music->rows + 1, music->columns, 1);
+
     gtk_widget_show_all(editor_grid);
     if (music->columns > 0 && music->rows > 0)
         select_cell(0, 0);
 }
 
 static void show_editor(void) {
+    memset(selected_tiles, 0, sizeof(selected_tiles));
     rebuild_editor();
+    activate_editor_tool(TOOL_SELECT);
     gtk_stack_set_visible_child_name(GTK_STACK(main_stack), "editor");
     gtk_window_set_title(GTK_WINDOW(main_window), "Music Emporium — Studio");
 }
@@ -709,27 +1319,48 @@ static void on_open_clicked(GtkButton *button, gpointer data) {
 //Builds the main menu window and returns it.
 GtkWidget *build_main_window(void) {
     const char *css =
-        "window { background-image: linear-gradient(135deg, #24103f, #6f32b5 55%, #b894e8); color: #24103f; }"
-        ".home-panel, .editor-panel, .inspector { background: rgba(255,255,255,0.96); border-radius: 18px; padding: 22px; box-shadow: 0 8px 24px rgba(28,8,48,0.28); }"
-        ".hero-title { color: #ffffff; font-size: 40px; font-weight: 800; }"
-        ".hero-subtitle { color: #eee3ff; font-size: 17px; }"
-        ".section-title { color: #47206f; font-size: 22px; font-weight: 700; }"
-        ".muted { color: #745f86; }"
-        ".primary { background-image: linear-gradient(to bottom, #9558dc, #6425a5); color: white; border-radius: 10px; border: 1px solid #57208f; padding: 10px 18px; font-weight: 700; }"
-        ".primary:hover { background-image: linear-gradient(to bottom, #a96bea, #7532bb); }"
-        ".secondary { background: #f5effc; color: #5b258e; border-radius: 10px; border: 1px solid #d8c2ee; padding: 10px 18px; }"
-        ".danger-soft { background: #fff1fa; color: #8a2866; border-radius: 8px; border: 1px solid #edc7df; }"
-        ".step-cell { background: #f7f2fb; border: 1px solid #e4d8ee; border-radius: 7px; color: white; padding: 0; }"
-        ".step-cell:hover { background: #eaddf6; border-color: #a96be0; }"
-        ".step-active { background-image: linear-gradient(135deg, #b266ed, #6c29ad); border-color: #5b218f; color: white; }"
-        ".step-selected { border: 3px solid #f0b7ff; box-shadow: 0 0 0 2px #6624a4; }"
-        ".step-playing { border: 3px solid #ffcf5a; box-shadow: 0 0 0 2px #8b5b00; }"
-        ".step-number { color: #806a91; font-size: 11px; padding: 4px; }"
-        ".piano-white { background: white; color: #2d173d; border-radius: 4px; border: 1px solid #cfc4d7; font-weight: 700; }"
-        ".piano-black { background-image: linear-gradient(to right, #271934, #4f3564); color: white; border-radius: 4px; border: 1px solid #1f1328; font-weight: 700; }"
-        "spinbutton { background: white; color: #3c2051; border: 1px solid #cdb5e2; border-radius: 8px; padding: 7px; }"
-        "notebook header { background: #f3eafb; } notebook tab:checked { color: #6425a5; font-weight: 700; }"
-        "statusbar { background: rgba(255,255,255,0.92); color: #55346b; }";
+        "* { font-family: 'Consolas', 'Courier New', monospace; }"
+        "window { color: #eeeaf4; background-image: linear-gradient(to bottom, #241a35 0%, #241a35 14%, #302044 14%, #302044 28%, #3d2755 28%, #3d2755 42%, #4a2d67 42%, #4a2d67 56%, #573478 56%, #573478 70%, #633b88 70%, #633b88 84%, #71479a 84%, #71479a 100%); }"
+        ".home-panel, .editor-panel, .inspector { background: #292532; color: #eeeaf4; border-radius: 2px; border: 2px solid #17141d; padding: 18px; box-shadow: 4px 4px #151119; }"
+        ".home-panel { border-top: 5px solid #a875db; }"
+        ".editor-panel { background: #211e28; }"
+        ".inspector { background: #302b39; border-top: 5px solid #7465a8; }"
+        ".retro-toolbar { background-image: linear-gradient(to bottom, #8f72be 0%, #8f72be 18%, #67508e 18%, #67508e 52%, #493760 52%, #493760 100%); border: 2px solid #1a1422; border-radius: 3px; padding: 7px; box-shadow: 3px 3px #17121d; }"
+        ".retro-menu { background: #211d27; color: #eeeaf4; border: 2px solid #17131c; padding: 2px; }"
+        ".retro-menu menuitem { padding: 5px 12px; } .retro-menu menuitem:hover { background: #765092; color: white; }"
+        ".transport { background: #28232f; border: 1px solid #16121b; padding: 3px; }"
+        ".tool-button { background: #393241; color: #d8cedf; border-radius: 1px; border: 1px solid #17131c; padding: 7px 9px; }"
+        ".tool-button:checked { background-image: linear-gradient(to bottom, #d0a3ef, #76469a); color: white; border: 2px solid #f2ddff; }"
+        ".hero-title { color: #ffffff; font-size: 38px; font-weight: 800; background: #51346f; border: 3px solid #d2afe9; padding: 10px 24px; box-shadow: 5px 5px #21152d; }"
+        ".hero-subtitle { color: #f4e9ff; font-size: 15px; font-weight: 700; }"
+        ".section-title { color: #cf9ff1; font-size: 20px; font-weight: 700; }"
+        ".muted { color: #b9afc4; }"
+        ".primary { background-image: linear-gradient(to bottom, #c39ae7 0%, #c39ae7 18%, #8a55bb 18%, #8a55bb 55%, #66368f 55%, #66368f 100%); color: white; border-radius: 2px; border: 2px solid #2e193f; padding: 8px 16px; font-weight: 700; }"
+        ".primary:hover { background-image: linear-gradient(to bottom, #dec1f6 0%, #dec1f6 22%, #a96bdc 22%, #a96bdc 100%); }"
+        ".secondary { background-image: linear-gradient(to bottom, #f3f0f6 0%, #f3f0f6 20%, #c9c2d1 20%, #c9c2d1 54%, #aaa1b4 54%, #aaa1b4 100%); color: #28202f; border-radius: 2px; border: 2px solid #403849; padding: 8px 14px; font-weight: 700; }"
+        ".secondary:hover { background: #ded6e7; }"
+        ".danger-soft { background: #512e4c; color: #ffd9ef; border-radius: 2px; border: 2px solid #8b4f78; }"
+        ".step-cell { background: #383340; border: 1px solid #19161e; border-radius: 0; color: white; padding: 0; box-shadow: inset 1px 1px #4b4554; }"
+        ".step-cell:hover { background: #53455f; border-color: #c292e0; }"
+        ".step-active { background-image: linear-gradient(to bottom, #d5a7f1 0%, #d5a7f1 25%, #9a58c7 25%, #9a58c7 70%, #66328e 70%, #66328e 100%); border-color: #e4c5f6; color: white; }"
+        ".step-selected { border: 3px solid #fcf2ff; box-shadow: 0 0 0 2px #9b5ac7; }"
+        ".tile-selected { border: 3px solid #67e6d2; box-shadow: 0 0 0 2px #245e62; }"
+        ".drag-target { border: 3px dashed #ffd65c; background: #65572d; }"
+        ".step-playing { border: 3px solid #f4d35e; box-shadow: 0 0 0 2px #3a2b08; }"
+        ".step-number { color: #aaa0b4; font-size: 11px; padding: 4px; }"
+        ".resize-grip { background-image: linear-gradient(to bottom, #b78adc 0%, #b78adc 25%, #70488e 25%, #70488e 75%, #4e3065 75%, #4e3065 100%); color: white; border: 2px solid #24172e; padding: 2px; }"
+        ".resize-grip:hover { background: #c69bea; border-color: #f0d9ff; }"
+        ".resize-add-preview { background-image: linear-gradient(135deg, #8df0df, #6f73dd); border: 2px solid #c8fff5; box-shadow: 0 0 0 2px #315b71; }"
+        ".resize-remove-preview { background: #c44782; border: 2px solid #ffb9d9; box-shadow: 0 0 0 2px #5d1f3d; }"
+        ".piano-white { background-image: linear-gradient(to right, #ffffff, #d9d4df); color: #211b27; border-radius: 1px; border: 2px solid #18151c; font-weight: 700; }"
+        ".piano-black { background-image: linear-gradient(to right, #17141c, #44394e); color: white; border-radius: 1px; border: 2px solid #0c0a0e; font-weight: 700; }"
+        "spinbutton { background: #18151d; color: #f1eaf5; border: 2px solid #756482; border-radius: 1px; padding: 6px; }"
+        ".volume-label { color: #f1eaf5; font-size: 11px; font-weight: 700; min-width: 38px; }"
+        "scale trough { background: #19161d; border: 1px solid #0d0b10; min-height: 8px; }"
+        "scale highlight { background: #ad71d2; }"
+        "scale slider { background-image: linear-gradient(to bottom, #ffffff, #9588a1); border: 1px solid #302838; border-radius: 1px; min-width: 10px; min-height: 18px; }"
+        "notebook header { background: #211d27; border-bottom: 2px solid #7a5b91; } notebook tab { color: #bdb4c5; padding: 7px 12px; } notebook tab:checked { color: white; background: #604077; font-weight: 700; }"
+        "statusbar { background: #17141c; color: #c7bdce; border-top: 2px solid #6f5980; }";
 
     GtkCssProvider *provider = gtk_css_provider_new();
     gtk_css_provider_load_from_data(provider, css, -1, NULL);
@@ -742,6 +1373,7 @@ GtkWidget *build_main_window(void) {
     gtk_window_set_default_size(GTK_WINDOW(main_window), 1120, 720);
     gtk_window_set_position(GTK_WINDOW(main_window), GTK_WIN_POS_CENTER);
     g_signal_connect(main_window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+    g_signal_connect(main_window, "key-press-event", G_CALLBACK(on_editor_key_press), NULL);
 
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(main_window), root);
@@ -756,14 +1388,14 @@ GtkWidget *build_main_window(void) {
     gtk_container_set_border_width(GTK_CONTAINER(home), 32);
     GtkWidget *title = gtk_label_new("Music Emporium");
     gtk_style_context_add_class(gtk_widget_get_style_context(title), "hero-title");
-    GtkWidget *subtitle = gtk_label_new("Shape a melody, one luminous step at a time.");
+    GtkWidget *subtitle = gtk_label_new("[ GAME AUDIO WORKSTATION // .ME FORMAT ]");
     gtk_style_context_add_class(gtk_widget_get_style_context(subtitle), "hero-subtitle");
     GtkWidget *home_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_widget_set_size_request(home_panel, 430, -1);
     gtk_style_context_add_class(gtk_widget_get_style_context(home_panel), "home-panel");
-    GtkWidget *welcome = gtk_label_new("Start a composition");
+    GtkWidget *welcome = gtk_label_new("NEW PROJECT / LOAD ASSET");
     gtk_style_context_add_class(gtk_widget_get_style_context(welcome), "section-title");
-    GtkWidget *hint = gtk_label_new("Create a fresh grid or continue from a .me file.");
+    GtkWidget *hint = gtk_label_new("Build loops, cues and retro game melodies on a pixel grid.");
     gtk_style_context_add_class(gtk_widget_get_style_context(hint), "muted");
     GtkWidget *btn_new = gtk_button_new_with_label("＋  New composition");
     GtkWidget *btn_open = gtk_button_new_with_label("⌁  Open composition");
@@ -786,13 +1418,81 @@ GtkWidget *build_main_window(void) {
 
     GtkWidget *editor = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
     gtk_container_set_border_width(GTK_CONTAINER(editor), 18);
+    GtkWidget *menu_bar = gtk_menu_bar_new();
+    gtk_style_context_add_class(gtk_widget_get_style_context(menu_bar), "retro-menu");
+    GtkWidget *file_item = gtk_menu_item_new_with_label("File");
+    GtkWidget *file_menu = gtk_menu_new();
+    GtkWidget *menu_save = gtk_menu_item_new_with_label("Save");
+    GtkWidget *menu_save_as = gtk_menu_item_new_with_label("Save As…");
+    GtkWidget *menu_export_wav = gtk_menu_item_new_with_label("Export as WAV…");
+    GtkWidget *menu_export_mp4 = gtk_menu_item_new_with_label("Export as MP4…");
+    GtkWidget *menu_separator = gtk_separator_menu_item_new();
+    GtkWidget *menu_library = gtk_menu_item_new_with_label("Return to Library");
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), menu_save);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), menu_save_as);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), gtk_separator_menu_item_new());
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), menu_export_wav);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), menu_export_mp4);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), menu_separator);
+    gtk_menu_shell_append(GTK_MENU_SHELL(file_menu), menu_library);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(file_item), file_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu_bar), file_item);
+    g_signal_connect(menu_save, "activate", G_CALLBACK(on_save_clicked), NULL);
+    g_signal_connect(menu_save_as, "activate", G_CALLBACK(on_save_as_clicked), NULL);
+    g_signal_connect(menu_export_wav, "activate", G_CALLBACK(on_export_clicked), GINT_TO_POINTER(0));
+    g_signal_connect(menu_export_mp4, "activate", G_CALLBACK(on_export_clicked), GINT_TO_POINTER(1));
+    g_signal_connect(menu_library, "activate", G_CALLBACK(on_back_to_home), NULL);
+    gtk_box_pack_start(GTK_BOX(editor), menu_bar, FALSE, FALSE, 0);
+
+    GtkWidget *edit_item = gtk_menu_item_new_with_label("Edit");
+    GtkWidget *edit_menu = gtk_menu_new();
+    GtkWidget *menu_grid_size = gtk_menu_item_new_with_label("Grid Size…");
+    GtkWidget *menu_add_column = gtk_menu_item_new_with_label("Add Column");
+    GtkWidget *menu_remove_column = gtk_menu_item_new_with_label("Remove Column");
+    GtkWidget *menu_add_row = gtk_menu_item_new_with_label("Add Row");
+    GtkWidget *menu_remove_row = gtk_menu_item_new_with_label("Remove Row");
+    gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), menu_grid_size);
+    gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), gtk_separator_menu_item_new());
+    gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), menu_add_column);
+    gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), menu_remove_column);
+    gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), menu_add_row);
+    gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), menu_remove_row);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(edit_item), edit_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu_bar), edit_item);
+    g_signal_connect(menu_grid_size, "activate", G_CALLBACK(on_grid_size_clicked), NULL);
+    g_signal_connect(menu_add_column, "activate", G_CALLBACK(on_adjust_grid_clicked), GINT_TO_POINTER(0));
+    g_signal_connect(menu_remove_column, "activate", G_CALLBACK(on_adjust_grid_clicked), GINT_TO_POINTER(1));
+    g_signal_connect(menu_add_row, "activate", G_CALLBACK(on_adjust_grid_clicked), GINT_TO_POINTER(2));
+    g_signal_connect(menu_remove_row, "activate", G_CALLBACK(on_adjust_grid_clicked), GINT_TO_POINTER(3));
+
     GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+    gtk_style_context_add_class(gtk_widget_get_style_context(toolbar), "retro-toolbar");
     GtkWidget *back = gtk_button_new_with_label("← Library");
     GtkWidget *save = gtk_button_new_with_label("Save");
     GtkWidget *previous = gtk_button_new_with_label("◀");
     play_button = gtk_button_new_with_label("▶  Play");
     GtkWidget *next = gtk_button_new_with_label("▶");
     GtkWidget *transport = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    gtk_style_context_add_class(gtk_widget_get_style_context(transport), "transport");
+    tool_buttons[TOOL_SELECT] = gtk_toggle_button_new_with_label("↖ Select [S]");
+    tool_buttons[TOOL_BRUSH] = gtk_toggle_button_new_with_label("✎ Brush [B]");
+    tool_buttons[TOOL_RECTANGLE] = gtk_toggle_button_new_with_label("▣ Rect [M]");
+    tool_buttons[TOOL_DRAG] = gtk_toggle_button_new_with_label("✥ Drag [D]");
+    for (int i = 0; i < 4; i++) {
+        gtk_style_context_add_class(gtk_widget_get_style_context(tool_buttons[i]), "tool-button");
+        g_signal_connect(tool_buttons[i], "toggled", G_CALLBACK(on_tool_toggled), GINT_TO_POINTER(i));
+        gtk_box_pack_start(GTK_BOX(transport), tool_buttons[i], FALSE, FALSE, 0);
+    }
+    changing_tool_buttons = TRUE;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tool_buttons[TOOL_SELECT]), TRUE);
+    changing_tool_buttons = FALSE;
+    GtkWidget *volume_icon = gtk_label_new("VOL");
+    GtkWidget *volume_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
+    gtk_widget_set_size_request(volume_scale, 115, -1);
+    gtk_scale_set_draw_value(GTK_SCALE(volume_scale), FALSE);
+    gtk_range_set_value(GTK_RANGE(volume_scale), audio_get_volume() * 100.0);
+    volume_label = gtk_label_new("75%");
+    gtk_style_context_add_class(gtk_widget_get_style_context(volume_label), "volume-label");
     gtk_style_context_add_class(gtk_widget_get_style_context(back), "secondary");
     gtk_style_context_add_class(gtk_widget_get_style_context(save), "primary");
     gtk_style_context_add_class(gtk_widget_get_style_context(previous), "secondary");
@@ -803,9 +1503,12 @@ GtkWidget *build_main_window(void) {
     gtk_style_context_add_class(gtk_widget_get_style_context(editor_title), "hero-subtitle");
     gtk_box_pack_start(GTK_BOX(toolbar), back, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(toolbar), editor_title, TRUE, TRUE, 8);
-    gtk_box_pack_start(GTK_BOX(transport), previous, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(transport), previous, FALSE, FALSE, 6);
     gtk_box_pack_start(GTK_BOX(transport), play_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(transport), next, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(transport), volume_icon, FALSE, FALSE, 6);
+    gtk_box_pack_start(GTK_BOX(transport), volume_scale, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(transport), volume_label, FALSE, FALSE, 2);
     gtk_box_pack_end(GTK_BOX(toolbar), save, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(toolbar), transport, FALSE, FALSE, 4);
     g_signal_connect(back, "clicked", G_CALLBACK(on_back_to_home), NULL);
@@ -813,12 +1516,13 @@ GtkWidget *build_main_window(void) {
     g_signal_connect(previous, "clicked", G_CALLBACK(on_previous_clicked), NULL);
     g_signal_connect(play_button, "clicked", G_CALLBACK(on_play_pause_clicked), NULL);
     g_signal_connect(next, "clicked", G_CALLBACK(on_next_clicked), NULL);
+    g_signal_connect(volume_scale, "value-changed", G_CALLBACK(on_volume_changed), NULL);
     gtk_box_pack_start(GTK_BOX(editor), toolbar, FALSE, FALSE, 0);
 
     GtkWidget *workspace = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 14);
     GtkWidget *grid_panel = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_style_context_add_class(gtk_widget_get_style_context(grid_panel), "editor-panel");
-    GtkWidget *grid_hint = gtk_label_new("PIANO ROLL  •  Select any step to shape its sound");
+    GtkWidget *grid_hint = gtk_label_new("PIANO ROLL  •  SELECT A STEP TO SHAPE ITS SOUND");
     gtk_widget_set_halign(grid_hint, GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(grid_hint), "muted");
     GtkWidget *grid_scroll = gtk_scrolled_window_new(NULL, NULL);

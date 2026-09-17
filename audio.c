@@ -20,6 +20,17 @@ typedef struct {
 
 static Voice voices[VOICE_COUNT];
 static int next_voice = 0;
+static double master_volume = 0.75;
+
+void audio_set_volume(double volume) {
+    if (volume < 0.0) volume = 0.0;
+    if (volume > 1.0) volume = 1.0;
+    master_volume = volume;
+}
+
+double audio_get_volume(void) {
+    return master_volume;
+}
 
 //Opens an output device for every voice.
 void audio_init(void) {
@@ -88,7 +99,8 @@ void play_tone(int frequency, int duration_ms) {
         double envelope = 1.0;
         if (i < fade_samples) envelope = (double)i / fade_samples;
         else if (i > sample_count - fade_samples) envelope = (double)(sample_count - i) / fade_samples;
-        buffer[i] = (short)(AMPLITUDE * envelope * sin(TWO_PI * frequency * t));
+        buffer[i] = (short)(AMPLITUDE * master_volume * envelope *
+                            sin(TWO_PI * frequency * t));
     }
 
     //Pick the next voice in a rotating fashion.
